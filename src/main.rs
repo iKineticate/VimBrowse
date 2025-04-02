@@ -1,38 +1,47 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod monitor;
 mod uiaccess;
 
-use rgb::RGB;
+use hotkey::send_keys;
+use monitor::get_primary_monitor_logical_size;
 use uiaccess::prepare_uiaccess_token;
+mod hotkey;
 
-use std::sync::{Arc, Mutex};
 use std::num::NonZeroU32;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use win_hotkeys::{VKey, HotkeyManager};
+use rgb::RGB;
+use win_hotkeys::{HotkeyManager, VKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VK_A, VK_CONTROL, VK_D, VK_DOWN, VK_END, VK_F5, VK_HOME, VK_SHIFT, VK_T, VK_TAB, VK_UP, VK_W,
+};
 use winit::{
-    platform::windows::{WindowAttributesExtWindows, WindowExtWindows},
-    event::WindowEvent,
     application::ApplicationHandler,
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::WindowEvent,
     event_loop::{ActiveEventLoop, EventLoop},
+    platform::windows::{WindowAttributesExtWindows, WindowExtWindows},
     window::{Window, WindowId, WindowLevel},
 };
-
-use std::rc::Rc;
 
 const SPEED: f32 = 0.1;
 
 struct App {
     window: Option<Rc<Window>>,
     time: std::time::Instant,
-    shortcut_key: Arc<Mutex<bool>>,
+    show_state: Arc<AtomicBool>,
 }
 
 impl App {
     fn create_window(&mut self, event_loop: &ActiveEventLoop) {
-        let state = self.shortcut_key.lock().unwrap();
+        let show_state = self.show_state.load(Ordering::Relaxed);
+        let (monitor_width, monitor_height) = get_primary_monitor_logical_size().unwrap();
 
-        if *state {
+        if show_state {
             if self.window.is_none() {
                 let window = event_loop
                     .create_window(
@@ -44,9 +53,10 @@ impl App {
                             .with_decorations(false)
                             .with_window_level(WindowLevel::AlwaysOnTop)
                             .with_transparent(true)
-                            .with_maximized(true)
+                            .with_inner_size(PhysicalSize::new(monitor_width, monitor_height))
+                            .with_position(PhysicalPosition::new(0, 0))
                             .with_active(false)
-                            .with_resizable(false)
+                            .with_resizable(false),
                     )
                     .unwrap();
 
@@ -99,7 +109,7 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
-            },
+            }
             WindowEvent::RedrawRequested => {
                 let (width, height) = {
                     let size = window.inner_size();
@@ -127,8 +137,6 @@ impl ApplicationHandler for App {
 
                 let mut buffer = surface.buffer_mut().unwrap();
 
-                // buffer.fill(0);
-
                 let buffer_len = (width * height) as usize;
                 if buffer.len() != buffer_len {
                     return;
@@ -140,10 +148,7 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // let start_time = std::time::Instant::now();
                 let elapsed = self.time.elapsed().as_secs_f32();
-                // self.time = elapsed;
-
                 let time_phase = (elapsed * SPEED) % 1.0;
 
                 // 绘制上边框
@@ -178,7 +183,8 @@ impl ApplicationHandler for App {
                 for y in bottom_y_start..height {
                     for x in 0..width {
                         let reversed_x = width - 1 - x;
-                        let p = width as f32 + (height - 2 * border_width) as f32 + reversed_x as f32;
+                        let p =
+                            width as f32 + (height - 2 * border_width) as f32 + reversed_x as f32;
                         let pos = p / perimeter;
                         let phase = (pos + time_phase) % 1.0;
                         let rgb = hsv_to_rgb(phase * 360.0, 1.0, 1.0);
@@ -205,7 +211,7 @@ impl ApplicationHandler for App {
                 buffer.present().unwrap();
 
                 window.request_redraw();
-            },
+            }
             _ => (),
         }
     }
@@ -243,22 +249,78 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> RGB<u8> {
 fn main() -> Result<()> {
     let _ = prepare_uiaccess_token().inspect(|_| println!("Successful acquisition of Uiaccess"));
 
-    let shortcut_key = Arc::new(Mutex::new(false));
-    let shortcut_key_clone = Arc::clone(&shortcut_key);
+    let show_state = Arc::new(AtomicBool::new(true));
+    let show_state_clone = Arc::clone(&show_state);
 
     let event_loop = EventLoop::new()?;
     let event_loop_proxy = event_loop.create_proxy();
 
     std::thread::spawn(move || {
+        let show_state = Arc::clone(&show_state_clone);
+
+        // 睡眠唤醒后键盘钩子失效，解决办法：重启键盘钩子？
         let mut hkm = HotkeyManager::new();
 
-        let shortcut_key = Arc::clone(&shortcut_key_clone);
-        hkm.register_hotkey(VKey::F23, &[VKey::LWin, VKey::Shift], move || {
-            let key = Arc::clone(&shortcut_key);
-            let mut key_guard = key.lock().unwrap();
-            *key_guard = !*key_guard;
+        // 返回顶部
+        hkm.register_hotkey(VKey::Q, &[], move || {
+            send_keys(&[VK_CONTROL, VK_HOME]);
+        })
+        .unwrap();
+
+        // 返回底部
+        hkm.register_hotkey(VKey::E, &[], move || {
+            send_keys(&[VK_CONTROL, VK_END]);
+        })
+        .unwrap();
+
+        // 关闭应用内窗口
+        hkm.register_hotkey(VKey::X, &[], move || {
+            send_keys(&[VK_CONTROL, VK_W]);
+        })
+        .unwrap();
+
+        // 创建应用内窗口
+        hkm.register_hotkey(VKey::T, &[], move || {
+            send_keys(&[VK_CONTROL, VK_T]);
+        })
+        .unwrap();
+
+        // 上
+        hkm.register_hotkey(VKey::W, &[], move || {
+            send_keys(&[VK_UP]);
+        })
+        .unwrap();
+
+        // 下
+        hkm.register_hotkey(VKey::S, &[], move || {
+            send_keys(&[VK_DOWN]);
+        })
+        .unwrap();
+
+        // 切换左标题页
+        hkm.register_hotkey(VKey::A, &[], move || {
+            send_keys(&[VK_CONTROL, VK_SHIFT, VK_TAB, VK_A]);
+        })
+        .unwrap();
+
+        // 切换左标题页
+        hkm.register_hotkey(VKey::D, &[], move || {
+            send_keys(&[VK_CONTROL, VK_TAB, VK_D]);
+        })
+        .unwrap();
+
+        // 刷新
+        hkm.register_hotkey(VKey::R, &[], move || {
+            send_keys(&[VK_F5]);
+        })
+        .unwrap();
+
+        // 暂停/启动
+        hkm.register_pause_hotkey(VKey::F23, &[VKey::LWin, VKey::Shift], move || {
+            show_state.store(!show_state.load(Ordering::Relaxed), Ordering::Relaxed);
             event_loop_proxy.send_event(()).unwrap();
-        }).unwrap();
+        })
+        .unwrap();
 
         hkm.event_loop();
     });
@@ -266,7 +328,7 @@ fn main() -> Result<()> {
     let mut app = App {
         window: None,
         time: std::time::Instant::now(),
-        shortcut_key: Arc::clone(&shortcut_key),
+        show_state,
     };
     event_loop.run_app(&mut app).unwrap();
 
