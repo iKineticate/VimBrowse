@@ -3,7 +3,7 @@
 mod monitor;
 mod uiaccess;
 
-use hotkey::send_keys;
+use hotkey::{send_keys, send_mouse_scoll};
 use hsv::hsv_to_rgb;
 use monitor::get_primary_monitor_logical_size;
 use uiaccess::prepare_uiaccess_token;
@@ -19,10 +19,10 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use softbuffer::Surface;
+use softbuffer::{Context, Surface};
 use win_hotkeys::{HotkeyManager, VKey};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    VK_A, VK_CONTROL, VK_D, VK_DOWN, VK_END, VK_F5, VK_HOME, VK_SHIFT, VK_T, VK_TAB, VK_UP, VK_W,
+    VK_A, VK_CONTROL, VK_D, VK_END, VK_F5, VK_HOME, VK_SHIFT, VK_T, VK_TAB, VK_W,
 };
 use winit::{
     application::ApplicationHandler,
@@ -38,10 +38,8 @@ const SPEED: f64 = 0.1;
 struct App {
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
-    time: Instant,
     last_window_size: (u32, u32),
-    border_width: u32,
-    perimeter: f64,
+    time: Instant,
     show_state: Arc<AtomicBool>,
 }
 
@@ -83,9 +81,9 @@ impl App {
 
             let (window, _context, mut surface) = {
                 let window = Rc::new(window);
-                let context = softbuffer::Context::new(window.clone())
+                let context = Context::new(window.clone())
                     .expect("Failed to create a new instance of context - {e}");
-                let surface = softbuffer::Surface::new(&context, window.clone())
+                let surface = Surface::new(&context, window.clone())
                     .expect("Failed to create a surface for drawing to window - {e}");
                 (window, context, surface)
             };
@@ -137,7 +135,6 @@ impl ApplicationHandler for App {
                     (size.width, size.height)
                 };
 
-                // 更新图形资源
                 let surface = self.surface.as_mut().unwrap();
                 if self.last_window_size != (width, height) {
                     surface
@@ -149,57 +146,55 @@ impl ApplicationHandler for App {
                     self.last_window_size = (width, height);
                 }
 
-                // 更新边框参数
-                let scale_factor = window.scale_factor();
-                self.border_width = (4.0 * scale_factor).round() as u32;
-                self.perimeter =
-                    2.0 * (width as f64 + height as f64 - 2.0 * self.border_width as f64);
-
-                // 获取绘图缓冲区
                 let mut buffer = surface.buffer_mut().unwrap();
                 let buffer_len = (width * height) as usize;
                 if buffer.len() != buffer_len {
                     return;
                 }
 
+                // 更新边框参数
+                let scale_factor = window.scale_factor();
+                let border_width = (4.0 * scale_factor).round() as u32;
+                let perimeter = (2 * (width + height - 2 * border_width)) as f64;
+
                 let elapsed = self.time.elapsed().as_secs_f64();
                 let time_phase = (elapsed * SPEED) % 1.0;
 
-                let buffer_slice = buffer.as_mut();
-                let border_width = self.border_width;
-                let perimeter = self.perimeter;
-
                 let bottom_y = height - border_width;
                 let right_x = width - border_width;
-                buffer_slice.iter_mut().enumerate().for_each(|(i, pixel)| {
-                    let x = i as u32 % width;
-                    let y = i as u32 / width;
 
-                    let in_top = y < border_width;
-                    let in_bottom = y >= bottom_y;
-                    let in_left = x < border_width;
-                    let in_right = x >= right_x;
+                buffer
+                    .as_mut()
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, pixel)| {
+                        let x = i as u32 % width;
+                        let y = i as u32 / width;
 
-                    if in_top || in_bottom || in_left || in_right {
-                        let pos = match () {
-                            _ if in_top => x as f64,
-                            _ if in_right => width as f64 + (y - border_width) as f64,
-                            _ if in_bottom => {
-                                width as f64
-                                    + (height - 2 * border_width) as f64
-                                    + (width - x - 1) as f64
-                            }
-                            _ => {
-                                (2 * width + height - 2 * border_width) as f64
-                                    + (height - y - border_width - 1) as f64
-                            }
-                        } / perimeter;
+                        let in_top = y < border_width;
+                        let in_bottom = y >= bottom_y;
+                        let in_left = x < border_width;
+                        let in_right = x >= right_x;
 
-                        let phase = (pos + time_phase) % 1.0;
-                        let rgb = hsv_to_rgb(phase * 360.0, 1.0, 1.0);
-                        *pixel = ((rgb.0 as u32) << 16) | ((rgb.1 as u32) << 8) | rgb.2 as u32;
-                    }
-                });
+                        if in_top || in_bottom || in_left || in_right {
+                            let pos = match () {
+                                _ if in_top => x,
+                                _ if in_right => width + (y - border_width),
+                                _ if in_bottom => {
+                                    width + (height - 2 * border_width) + (width - x - 1)
+                                }
+                                _ => {
+                                    (2 * width + height - 2 * border_width)
+                                        + (height - y - border_width - 1)
+                                }
+                            } as f64
+                                / perimeter;
+
+                            let phase = (pos + time_phase) % 1.0;
+                            let rgb = hsv_to_rgb(phase * 360.0, 1.0, 1.0);
+                            *pixel = ((rgb.0 as u32) << 16) | ((rgb.1 as u32) << 8) | rgb.2 as u32;
+                        }
+                    });
 
                 buffer.present().unwrap();
 
@@ -230,10 +225,8 @@ fn main() -> Result<()> {
     let mut app = App {
         window: None,
         surface: None,
-        time: Instant::now(),
         last_window_size: (0, 0),
-        border_width: 4,
-        perimeter: 0.0,
+        time: Instant::now(),
         show_state,
     };
     event_loop.run_app(&mut app).unwrap();
@@ -247,7 +240,6 @@ fn listen_and_send(
 ) {
     let show_state = Arc::clone(&show_state);
 
-    // 睡眠唤醒后键盘钩子失效，解决办法：重启键盘钩子？
     let mut hkm = HotkeyManager::new();
 
     // 返回顶部
@@ -276,13 +268,15 @@ fn listen_and_send(
 
     // 上
     hkm.register_hotkey(VKey::W, &[], move || {
-        send_keys(&[VK_UP]);
+        send_mouse_scoll(1);
+        // send_keys(&[VK_UP]);
     })
     .unwrap();
 
     // 下
     hkm.register_hotkey(VKey::S, &[], move || {
-        send_keys(&[VK_DOWN]);
+        send_mouse_scoll(-1);
+        // send_keys(&[VK_DOWN]);
     })
     .unwrap();
 
